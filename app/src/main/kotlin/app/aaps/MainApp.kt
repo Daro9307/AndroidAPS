@@ -306,6 +306,18 @@ class MainApp : Application(), HasAndroidInjector, Configuration.Provider {
                 })
                 return
             }
+            // Step 2: prune the deletable backlog BEFORE VACUUM so its rebuild processes far fewer
+            // rows (smaller working set → less memory → less likely to native-abort). vacuumDatabaseIfDue
+            // runs before plugins/KeepAlive, so the daily cleanup hasn't run yet on this launch; without
+            // this, VACUUM always rebuilds the full backlog (the reporter's 20–50k stale rows).
+            // deleteTrackedChanges = false keeps it NS-sync-safe (never prunes referenceId-tracked rows).
+            // This runs before the crash marker because it is a plain transactional delete, not the
+            // native-abort-prone VACUUM; if the process dies here the next launch simply retries it.
+            val cleanupReport = persistenceLayer.cleanupDatabase(6L * 31, deleteTrackedChanges = false)
+            aapsLogger.info(LTag.CORE, "Startup pre-VACUUM cleanup removed:\n$cleanupReport")
+            // Mark the daily cleanup done so KeepAliveWorker doesn't immediately repeat it.
+            preferences.put(LongNonKey.LastCleanupRun, dateUtil.now())
+
             // Commit the marker synchronously BEFORE running: a plain put() uses apply() and may not
             // reach disk before an early native abort (e.g. during the wal_checkpoint VACUUM starts with).
             sp.edit(commit = true) { putBoolean(BooleanNonKey.VacuumInProgress.key, true) }
