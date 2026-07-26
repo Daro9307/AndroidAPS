@@ -110,6 +110,46 @@ class SyncPumpExtendedBolusTransactionTest {
         assertThat(running.amount).isWithin(0.1).of(3.0)
     }
 
+    @Test
+    fun `does not supersede running when new timestamp equals running - regression for setEnd require crash`() = runTest {
+        // Same extended bolus synced twice with a colliding (second-resolution) timestamp: the command
+        // path and the pump history event. Superseding here would set end == timestamp -> duration 0 ->
+        // ExtendedBolus.setEnd require(duration > 0) throws and crashes the app. The guard must skip it.
+        val eb = createExtendedBolus(pumpId = 100L, timestamp = 1000L, amount = 5.0, duration = 60_000L)
+        val running = createExtendedBolus(pumpId = 50L, timestamp = 1000L, amount = 6.0, duration = 60_000L)
+
+        whenever(extendedBolusDao.findByPumpIds(100L, InterfaceIDs.PumpType.DANA_I, "ABC123")).thenReturn(null)
+        whenever(extendedBolusDao.getExtendedBolusActiveAtLegacy(1000L)).thenReturn(running)
+
+        val transaction = SyncPumpExtendedBolusTransaction(eb)
+        transaction.database = database
+        val result = transaction.run() // must not throw
+
+        assertThat(result.updated).isEmpty()          // running was not superseded
+        assertThat(result.inserted).hasSize(1)        // new record still inserted
+        assertThat(running.interfaceIDs.endId).isNull()
+        assertThat(running.amount).isEqualTo(6.0)      // untouched
+        verify(extendedBolusDao).insertNewEntry(eb)
+    }
+
+    @Test
+    fun `does not supersede running when new timestamp precedes running`() = runTest {
+        // Inverted timestamps (T_new < T_running) would also make end - timestamp negative.
+        val eb = createExtendedBolus(pumpId = 100L, timestamp = 1000L, amount = 5.0, duration = 60_000L)
+        val running = createExtendedBolus(pumpId = 50L, timestamp = 2000L, amount = 6.0, duration = 60_000L)
+
+        whenever(extendedBolusDao.findByPumpIds(100L, InterfaceIDs.PumpType.DANA_I, "ABC123")).thenReturn(null)
+        whenever(extendedBolusDao.getExtendedBolusActiveAtLegacy(1000L)).thenReturn(running)
+
+        val transaction = SyncPumpExtendedBolusTransaction(eb)
+        transaction.database = database
+        val result = transaction.run() // must not throw
+
+        assertThat(result.updated).isEmpty()
+        assertThat(result.inserted).hasSize(1)
+        assertThat(running.interfaceIDs.endId).isNull()
+    }
+
     private fun createExtendedBolus(
         pumpId: Long,
         timestamp: Long,
